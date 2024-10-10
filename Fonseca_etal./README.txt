@@ -1,1 +1,1 @@
-Here are all the scripts concerning the paper "Antibody selection strategies and their impact in the analysis of malaria multi-sera data"
+In this repository you will find all the scripts concerning the paper "Antibody selection strategies and their impact in the analysis of malaria multi-sera data". For more information we recommend you to visit: https://pubmed.ncbi.nlm.nih.gov/38273386/
