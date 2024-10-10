@@ -1,0 +1,385 @@
+---
+title: "Results_Parametric_and_OptimalApproach_BH.final.version"
+author: "Andre"
+date: '2022-06-15'
+output:
+  html_document:
+    theme: united
+    toc_depht: 4
+    toc_float:
+      collapsed: false 
+      smoth_scroll: false
+    toc: true
+    code_download: true
+    code_folding: hide
+---
+
+# specify script options
+```{r}
+knitr::opts_chunk$set(echo = TRUE, warning = FALSE)
+```
+
+# Load the required libraries & set seed
+```{r}
+#Load libraries
+library(MASS)       # Perform general functions
+library(dplyr)      # Better handle data
+library(pROC)       # Perofrm Roc curve 
+library(nortest)    # Perform normality test
+library(mixsmsn)    # Mixture model
+library(AID)        # Perform box-cox transformation
+library(doParallel) # Parallel processing
+library(sn)         # Regression skew
+library(tidyr)      # Handle data for ggplot2
+library(ggplot2)    # Plot the data
+library(lmtest)     # Perform the likelihood test
+library(caret)      # Use for CV prerformance
+library(SuperLearner) # Apply Superlearner to make predictions
+library(OptimalCutpoints) # Obtain the optimal cutpoints
+library(naniar)     # View missing data
+library(ggrepel)
+set.seed(42)       # Have reproducible results
+```
+
+# Allow parallel processing
+```{r}
+# Specify the number of cores
+numCores <- detectCores()
+registerDoParallel(numCores)  # use multicore, set to the number of our cores
+```
+
+
+# Load and preprocess the data
+```{r}
+#Load the data
+KEN <- read.csv("KEN.csv", header=T, check.names=FALSE)
+
+# Check for missing data
+vis_miss(KEN) # WE have a few missing values
+
+# Attribute subject id to rownames
+rownames(KEN) <- KEN$SubjectID
+
+# select only patitents with parasite at screening
+my.data <- subset(KEN, KEN$ParasiteAtScreen==1)
+
+# Ignore variables not used in the paper
+ignore <- c("SubjectID","NEpisodes","TimeToFirstEpisode", "ParasiteAtScreen", "Age", "SchizontReactivity", "Status")
+X <- my.data[, !colnames(my.data) %in% ignore] # Data containing only the antibody values
+Y <- data.frame( "Status" = my.data[, colnames(my.data) %in% "Status"]); rownames(Y) <- my.data$SubjectID # Data containing the status
+
+# Check for missing data
+vis_miss(X) # WE have no missing values
+```
+
+
+So all our points have existing values
+
+
+## Perfrom a preliminary analysis on Age against the individual's Status
+```{r}
+#Plot the boxplot
+cols <- ifelse(my.data$Status == "protected", "grey40", "gray90")
+boxplot(my.data$Age ~ my.data$Status, col = cols, xlab ="Status", ylab ="Age")
+```
+
+# Data transformation and Normality assessment
+```{r}
+#  Specify parameters for the box-cox function
+n <- ncol(X)
+outcome <-  as.factor(Y$Status)
+out <- ifelse(outcome == "protected",1,0)
+
+# Run the algorithm across all aantibodies
+bc.vals <- foreach (i=X[,1:n], .combine=rbind) %dopar% {
+  bc <- AID::boxcoxlm(x= matrix(out, ncol = 1, nrow = length(out)), y= i, lambda = seq(-10,10,0.01))
+  vec <-  data.frame("lambda" = bc$lambda.hat, "p.value" = bc$p.value)
+}
+
+# Attribute rownames
+rownames(bc.vals) <- colnames(X)
+
+# Add a column called "Sig" wich will allow us to collor the dots according to their significance level
+bc.vals$sig <- as.factor(ifelse(bc.vals$lambda > -4 & bc.vals$p.value > 0.05, "Accept Null Hypothesis", "Reject Null Hypothesis"))
+
+# Plot
+ggplot(bc.vals, aes(-log10(p.value), lambda, color = sig))+ geom_point(size = 2) +
+  geom_hline(yintercept= 4, linetype="dashed", color = "grey") + theme_classic() +
+  scale_color_manual(values=c("grey", "#F8766D"))  + scale_x_continuous(labels= c(0,0.01, 0.0001, 0.000001),position = 'top') +
+  geom_vline(xintercept= -log10(0.05), linetype="dashed", color = "grey") + theme_classic() +
+  xlab("p.value")
+```
+
+## Select the normally distributed antibodies
+```{r}
+bc.normal <- subset(bc.vals, bc.vals$p.value > 0.05)
+nrow(bc.normal)
+min(bc.normal$lambda)
+max(bc.normal$lambda)
+```
+A total of 6 antibodies follow a normal distribution
+
+## Obtain the transformed data for the 6 antibodies  
+```{r}
+# Subset only the 6 antibodies from the original dataset
+tf.data <- X[, colnames(X) %in% rownames(bc.normal)]
+
+# Obtain the transformed datasets for the 6 antibodies
+tf.datasets <- data.frame("Status" = Y$Status)
+
+for (i in 1:length(tf.data)) {
+  bc.val <- (tf.data[,i]^bc.normal$lambda[i] - 1)/ bc.normal$lambda[i]
+  tf.datasets <- cbind(tf.datasets, bc.val)
+}
+
+# Attribute the na,es
+colnames(tf.datasets)[2:ncol(tf.datasets)] <-  colnames(tf.data)
+```
+
+Now that we have the transformed data we can use the T-test
+
+# Plot the densitty plot for pf34 whith non-trnasformed and transformed data values
+```{r}
+# Plot the non transformed data
+ggplot(my.data, aes(x = pf34, color = Status ,fill = Status)) +
+  geom_density(alpha= 0.4) + theme_classic() +xlab("pf34 value")
+
+# Plot the transformed data
+ggplot(tf.datasets, aes(x = pf34, color = Status ,fill = Status)) +
+  geom_density(alpha= 0.4) + theme_classic() +xlab(paste0("pf34 value (",expression(lambda), ": -0.78)"))
+
+```
+
+
+# Perform the T-test
+```{r}
+# Remove the Status variable
+t.data <- tf.datasets[, !colnames(tf.datasets) %in% "Status"]
+
+# Writte the T-test functio
+t_test <- function(x) {
+  ab.t <- t.test(x ~ Y$Status, alternative = "two.sided", var.equal = F )$p.value
+  return(ab.t)
+}
+  
+# Perform the t-test
+t.vals <- data.frame(sapply(t.data, t_test))
+colnames(t.vals) <- "p.value"
+
+# Subset the significant and non-significant antibodies 
+t.accept <- subset(t.vals, t.vals$p.value < 0.05)   
+t.excluded <- subset(t.vals, t.vals$p.value > 0.05)
+
+print(paste("A total of", dim(t.accept)[1],"antibodies were statistically significant for the t-test"))
+```
+
+```{r}
+# Select the non normally distributed antibodies
+non.data <- X[, ! colnames(X) %in% colnames(t.data)]
+X <-  non.data
+
+f.pval <- data.frame()                        # Data.frame to store p.values from single antibody
+all.pval <- data.frame()                      # Data.frame to store best p.value fo each antibody
+sens_spe.vals <-  data.frame()                # Dataf.rame to store sensitivity and specificity values
+new.data <-  data.frame("Status" = Y$Status)  # Data.frame to store the dichotomized values
+
+# Function with the algorithm itself
+for (i in 1:ncol(X)) {
+  ab <- X[,i]   # Define column (antibody)
+  
+  for (j in 1:length(ab)) {   # For each value of the antibody:
+    trs <-  ab[j]             # Define the antibody value as a threshold
+    ss <- ifelse(ab > trs, "Seropositive", "Seronegative") # Patients with Values above the treshold are sero +  and below sero -
+    tab <- table(ss, Y$Status)  # Obtain the number of individuals for each class
+    
+    if( nrow(tab) < 2 | ncol(tab) <2 ){ # Put every important value into a dataframe
+      p.val <- data.frame("p.value"= NA, "threshold" = trs, "Seronegative" = table(ss)[1], "Seropositive" = table(ss)[2], "Seropositivity" = (table(ss)[2])/121 )
+    }else{
+     p.val <- data.frame("p.value"= chisq.test(tab)$p.value, "threshold" =trs, "Seronegative"= table(ss)[1], "Seropositive" = table(ss)[2],"Seropositivity" = (table(ss)[2])/121)
+    }
+    f.pval <- rbind(f.pval, p.val)  # Bind the above information for every possible threshold
+    
+  }
+  b.pval <- f.pval[which.min(f.pval$p.value),]    # Select the threshold for which the p-value is lowest ( higher discriminatory power)
+  all.pval <- rbind(all.pval, b.pval)             # Bind this information together
+  new.val <-  ifelse(ab > b.pval$threshold, 1, 2) # Dichotomize the data
+  new.data <- cbind(new.data, new.val)            # Build the data.frame with the dichotomized values
+  tab <- table(new.val, Y$Status)                 # Create a 2x2 table to obtain sensitivity and specificity
+  sn.sp <- data.frame("Sensitivity" = tab[1]/sum(tab[,1]),
+                      "Specificity" = tab[4]/sum(tab[,2])) # Get sensitivity and specificity
+  sens_spe.vals <- rbind(sens_spe.vals, sn.sp)  # Bind everything on a data.frame
+  
+  f.pval <-  data.frame() # Clear the data.frame
+  b.pval <- data.frame()  # Clear the data.frame
+}
+
+# Attirbute the respective col/rownames
+rownames(all.pval) <- colnames(X)
+colnames(new.data)[2:ncol(new.data)] <- colnames(X)
+rownames(sens_spe.vals) <-  colnames(X)
+
+```
+
+
+# Obtain all the p.values across all test in a single table
+```{r}
+p.values_data <- rbind(data.frame("Antibody"= rownames(t.vals),
+                                  "p.value" = t.vals$p.value, 
+                                  "Test"= "T-test"),
+                        data.frame("Antibody"= rownames(all.pval),
+                                   "p.value" = all.pval$p.value, 
+                                   "Test" = "Chi-squared"))
+
+dim(p.values_data)
+```
+
+
+# Plot the p.values graph
+```{r}
+p.values_data$Significance <- ifelse(p.values_data$p.value <0.05, "significant","not significant")
+  
+# Function to simulate default
+theme_new <- function(base_size = 12, base_family = "Helvetica"){
+  theme_bw(base_size = base_size, base_family = base_family) %+replace%
+    theme(
+      #line = element_line(colour="black"),
+      #text = element_text(colour="black"),
+      axis.title = element_text(size = 14),
+      #axis.text = element_text(colour="black", size=8),
+      #strip.text = element_text(size=12),
+      legend.key=element_rect(colour=NA, fill =NA),
+      panel.grid = element_blank(),   
+      panel.border = element_rect(fill = NA, colour = "black", size=1),
+      panel.background = element_rect(fill = "white", colour = "black"), 
+      strip.background = element_rect(fill = NA),
+      axis.text.x = element_text(angle = 90, vjust = 0.5, hjust=1),
+      legend.position = c(0.92, 0.30),
+      legend.background = element_rect(size=0.5, linetype="solid")
+    )
+}
+
+# PLot the p.values
+ggplot(p.values_data, aes(x=Antibody, y=log10(p.value), color = Significance, shape = Test)) +
+  geom_point(size = 4) + 
+  scale_color_manual(values=c("blue", "salmon")) +
+  geom_hline(yintercept = log10(0.05), lty=2, col = "black") +
+  coord_cartesian( ylim = c(-7, 0)) +
+  scale_y_continuous( breaks = c( 0, -1,-2,-3,-4,-5, -6, -7), labels= c(1, 0.1, 0.01, 0.001 , 0.0001, 0.00001, 0.000001, 0.0000001)) +
+  theme_new() +
+  ylab("p.value") + theme(axis.text.x = element_text(angle = 90, vjust = 0.5, hjust=1), axis.text=element_text(size=15))
+
+```
+
+
+# Perform p.value correction (Benjamini-Hochberg)
+```{r}
+# Adjust the p.value
+p.values_ad<- p.adjust(p.values_data$p.value, method = "BH", n=length(p.values_data$p.value))
+
+p.values_ad <-  data.frame("Antibody"= p.values_data$Antibody, 
+                           "p.value" = p.values_ad,
+                           "Test" = p.values_data$Test,
+                           "Significance" = ifelse(p.values_ad <0.05,"significant","not significant"))
+
+ggplot(p.values_ad, aes(x=Antibody, y=log10(p.value), color = Significance, shape = Test)) +
+  geom_point(size = 4) + 
+  scale_color_manual(values=c("blue", "salmon")) +
+  geom_hline(yintercept = log10(0.05), lty=2, col = "black") +
+  coord_cartesian( ylim = c(-7, 0)) +
+  scale_y_continuous( breaks = c( 0, -1,-2,-3,-4,-5, -6, -7), labels= c(1, 0.1, 0.01, 0.001 , 0.0001, 0.00001, 0.000001, 0.0000001)) +
+  theme_new() +
+  ylab("p.value") + theme(axis.text.x = element_text(angle = 90, vjust = 0.5, hjust=1), axis.text=element_text(size=15))
+```
+
+
+# Subset the statistically significant antibodies
+```{r}
+# Subset the only statsitically significant after p.value correction
+p.value.sig <- subset(p.values_ad, p.values_ad$p.value < 0.05 )
+table(p.value.sig$Test)
+print(paste("After the p.value correction with the BH test we have a total of", dim(p.value.sig)[1], "significant antibodies"))
+
+```
+
+# Obtain the final with all the significant antibodies
+```{r}
+# Obtain the statistically significant antibodies for each antibody/dataset
+t.abs <- t.data[, colnames(t.data) %in% p.value.sig$Antibody]
+p.abs <- new.data[, colnames(new.data) %in% p.value.sig$Antibody]
+
+for (i in 1:ncol(p.abs)) {
+  p.abs[,i] <-  ifelse(p.abs[,i] == 1,1,0)
+  
+}
+
+# Bind everything
+data <- cbind("Status"= Y$Status, t.abs, p.abs)
+```
+
+
+# Use the SuperLearner
+```{r}
+# Wi will used 5 models:  "SL.glm" , "SL.randomForest",  "SL.lda" , "SL.qda"  and "Xgboost"
+x_train <- data[, !colnames(data) %in% "Status" ]
+y_train <- ifelse(data$Status == "protected",1,0)
+
+# Implment the SuperLearner
+set.seed(42)
+sl = CV.SuperLearner(Y = y_train, X = x_train, family = binomial(),
+                        V = nrow(x_train),
+                        SL.library = c("SL.glm", "SL.randomForest","SL.lda", "SL.qda", "SL.xgboost"))
+# Review results.
+summary(sl)
+
+#Obtain the weights
+review_weights <- function(cv_sl) {
+    meta_weights = coef(cv_sl)
+    means = colMeans(meta_weights)
+    sds = apply(meta_weights, MARGIN = 2,  FUN = sd)
+    mins = apply(meta_weights, MARGIN = 2, FUN = min)
+    maxs = apply(meta_weights, MARGIN = 2, FUN = max)
+    sl_stats = cbind("mean(weight)" = means, "sd" = sds, "min" = mins, "max" = maxs)
+    sl_stats[order(sl_stats[, 1], decreasing = TRUE), ]
+}
+
+# WEIGHTS
+print(review_weights(sl), digits = 3)
+  
+
+# Obtain the roc curve 
+roc <- roc(y_train , sl$SL.predict)
+print(roc)
+
+# Obtain the cut-offs
+X <- data.frame("X"= sl$SL.predict, "Y" = y_train )
+
+# Obtain the optimal cutpoints (point closest to the top left and sensitivity = specificity)
+opt.roc01 <- optimal.cutpoints("X", "Y", tag.healthy = 0, method = "ROC01" , data = X)
+opt.spse <- optimal.cutpoints("X", "Y", tag.healthy = 0, method = "SpEqualSe", data = X)
+
+print("ROC01")
+print(summary(opt.roc01))
+
+print("SpEqualSe")
+print(summary(opt.spse ))
+
+#Obtain the summary
+s.roc01 <- summary(opt.roc01) 
+s.sesp <- summary(opt.spse)   
+
+# Obtain the thresold point
+t.roc01 <- s.roc01$p.table$Global$ROC01[[1]][1]
+t.sesp <- s.sesp$p.table$Global$SpEqualSe[[1]][1]
+
+
+#PLot in the roc curve
+plot(roc, legacy.axes = T )
+
+#PLot the points
+points(x= s.roc01$p.table$Global$ROC01[[1]][3], y=s.roc01$p.table$Global$ROC01[[1]][2], col ="#F8766D", pch = 19, cex=1.5)
+text(x=s.roc01$p.table$Global$ROC01[[1]][3] + 0.1, y =s.roc01$p.table$Global$ROC01[[1]][2] +0.05, paste("ROC01:",round(s.roc01$p.table$Global$ROC01[[1]][1],3)), col= "#F8766D")
+
+points(x= s.sesp$p.table$Global$SpEqualSe[[1]][3], y=s.sesp$p.table$Global$SpEqualSe[[1]][2], col ="#619CFF", pch = 19, cex=1.5)
+text(x=s.sesp$p.table$Global$SpEqualSe[[1]][3] - 0.20, y =s.sesp$p.table$Global$SpEqualSe[[1]][2] -0.075, paste("SpEqualSe:",round(s.sesp$p.table$Global$SpEqualSe[[1]][1],3)), col= "#619CFF")
+```
+
