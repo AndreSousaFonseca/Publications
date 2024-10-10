@@ -1,0 +1,1 @@
+In this repository you will find all the scripts concerning the paper "IgG Antibody Responses to Epstein-Barr Virus in Myalgic Encephalomyelitis/Chronic Fatigue Syndrome: Their Effective Potential for Disease Diagnosis and Pathological Antigenic Mimicry". For more information we recommend you to visit: https://pubmed.ncbi.nlm.nih.gov/38256421/
